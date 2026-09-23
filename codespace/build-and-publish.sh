@@ -31,7 +31,14 @@ log(){ printf '\n[release-pipeline] %s\n' "$*"; }
 log "REPO=$REPO TAG=$TAG SHA=$SHORT"
 
 # ---------- 0. 预检 ----------
-gh auth status >/dev/null || { echo "gh 未登录, 先 gh auth login"; exit 1; }
+# Codespaces 的 GITHUB_TOKEN 只注入登录 shell; 经 `gh codespace ssh -- cmd`(非登录)
+# 进来时 env 里没有。这里兜底 source profile, 仍无则提示用 bash -lc 调本脚本。
+if [ -z "${GITHUB_TOKEN:-}${GH_TOKEN:-}" ]; then
+  for f in "$HOME/.profile" /etc/profile.d/codespaces*.sh; do
+    [ -r "$f" ] && . "$f" 2>/dev/null || true
+  done
+fi
+gh auth status >/dev/null || { echo "gh 未登录(GITHUB_TOKEN 缺失?)。请用: bash -lc 'TAG=... bash codespace/build-and-publish.sh'"; exit 1; }
 if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
   echo "TAG $TAG 已存在 Release, 中止(避免重复上传)"; exit 1
 fi
