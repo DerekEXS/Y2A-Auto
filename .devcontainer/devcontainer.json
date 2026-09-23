@@ -6,7 +6,9 @@
     "ghcr.io/devcontainers/features/sshd:1": {
       "version": "latest"
     },
-    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "moby": false
+    }
   },
   "postCreateCommand": "python -m pip install --upgrade pip && python -m pip install -r requirements.txt pytest",
   "hostRequirements": {
