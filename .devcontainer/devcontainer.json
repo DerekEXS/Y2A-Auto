@@ -1,0 +1,25 @@
+{
+  "name": "y2a-auto-codespace-release",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/sshd:1": {
+      "version": "latest"
+    },
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "postCreateCommand": "python -m pip install --upgrade pip && python -m pip install -r requirements.txt pytest",
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "16gb",
+    "storage": "32gb"
+  },
+  "customizations": {
+    "codespaces": {
+      "openFiles": ["codespace/build-and-publish.sh"]
+    }
+  },
+  "remoteEnv": {
+    "REPO": "DerekEXS/Y2A-Auto"
+  }
+}

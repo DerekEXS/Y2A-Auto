@@ -21,6 +21,293 @@ from .utils import (
 
 import openai
 
+from types import SimpleNamespace
+
+# ---------------------------------------------------------------------------
+# curl_cffi 客户端：绕过 Cloudflare 对 Python 默认 TLS 指纹的拦截
+# 2026-08-04 添加：当上游是 cloudzone-api.cyou / opencode.ai 等被 CF 保护的端点时，
+# 标准 openai 库用 Python httpx 客户端的 TLS 指纹会被 403/1010 拦截。
+# 用 curl_cffi impersonate='chrome120' 模拟真实浏览器 TLS 指纹。
+# ---------------------------------------------------------------------------
+
+_CURL_CFFI_INSTALLED = False
+try:
+    from curl_cffi import requests as _cffi_requests  # type: ignore
+    _CURL_CFFI_INSTALLED = True
+except Exception:  # pragma: no cover
+    _cffi_requests = None  # type: ignore
+
+
+# ---------------------------------------------------------------------------
+# curl_cffi 网络请求重试封装
+# 2026-08-17 添加：cloudzone-api.cyou 网关对部分请求（尤其大 body）间歇性掐断
+# SSL 连接，报 curl: (35) BoringSSL SSL_connect: SSL_ERROR_SYSCALL。
+# 这不是超时（0.5s 就断），是网络层抖动，重试即可恢复（实测 ~20% 失败率，
+# 第 2 次几乎必成）。只重试网络层异常，不重试 HTTP 4xx 业务错误。
+# ---------------------------------------------------------------------------
+_CFFI_RETRY_MAX = 3
+_CFFI_RETRY_BACKOFFS = (1.0, 2.0, 4.0)  # 指数退避秒数
+
+
+def _cffi_post_with_retry(url, json_body, headers, timeout, *, label='chat'):
+    """带网络层重试的 curl_cffi POST。
+
+    只对连接/SSL 层异常重试（curl_cffi 抛 Exception）；HTTP 4xx/5xx 响应
+    不重试（由调用方判定是否 fallback 或报错）。
+    返回: _cffi_requests 的 response 对象。
+    抛: RuntimeError（重试耗尽后包装最后一次异常）。
+    """
+    _log = logging.getLogger(__name__)
+    last_exc = None
+    for attempt in range(_CFFI_RETRY_MAX):
+        try:
+            return _cffi_requests.post(
+                url,
+                json=json_body,
+                headers=headers,
+                timeout=timeout,
+                impersonate='chrome120',
+            )
+        except Exception as exc:
+            last_exc = exc
+            # 判断是否值得重试：网络/SSL/连接类异常才重试
+            exc_text = (str(exc) or '').lower()
+            retryable = any(s in exc_text for s in (
+                'ssl', 'connect', 'timeout', 'timed out',
+                'connection', 'reset', 'broken pipe', 'eof',
+                'failed to perform',
+            ))
+            if not retryable or attempt == _CFFI_RETRY_MAX - 1:
+                raise RuntimeError('curl_cffi 调用失败: {}'.format(exc)) from exc
+            backoff = _CFFI_RETRY_BACKOFFS[min(attempt, len(_CFFI_RETRY_BACKOFFS) - 1)]
+            _log.warning(
+                "curl_cffi %s 请求失败(尝试 %d/%d), %.1fs 后重试: %s: %s",
+                label, attempt + 1, _CFFI_RETRY_MAX, backoff,
+                exc.__class__.__name__, str(exc)[:160],
+            )
+            time.sleep(backoff)
+    # 不应到达
+    raise RuntimeError('curl_cffi 调用失败: {}'.format(last_exc)) from last_exc
+
+
+def _wrap_chat_completion_data(data):
+    """把 OpenAI chat.completions JSON 响应包装成类对象（兼容 openai 库返回结构）。"""
+    choices = []
+    for ch in (data.get('choices') or []):
+        msg = ch.get('message') or {}
+        message = SimpleNamespace(
+            role=msg.get('role') or 'assistant',
+            content=msg.get('content') or '',
+            reasoning_content=msg.get('reasoning_content') or '',
+        )
+        choices.append(SimpleNamespace(
+            index=ch.get('index') or 0,
+            message=message,
+            finish_reason=ch.get('finish_reason') or 'stop',
+        ))
+    usage_data = data.get('usage') or {}
+    usage = SimpleNamespace(
+        prompt_tokens=usage_data.get('prompt_tokens') or 0,
+        completion_tokens=usage_data.get('completion_tokens') or 0,
+        total_tokens=usage_data.get('total_tokens') or 0,
+    )
+    return SimpleNamespace(
+        id=data.get('id') or '',
+        object=data.get('object') or 'chat.completion',
+        created=data.get('created') or 0,
+        model=data.get('model') or '',
+        choices=choices,
+        usage=usage,
+    )
+
+
+class _CurlCffiChatCompletions:
+    """模拟 client.chat.completions.create 接口，内部走 curl_cffi。"""
+
+    def __init__(self, parent):
+        self._parent = parent
+
+    def create(self, **kwargs):
+        if not _CURL_CFFI_INSTALLED:  # pragma: no cover
+            raise RuntimeError("curl_cffi 未安装，无法使用 CurlCffiOpenAIClient")
+        url = self._parent.base_url.rstrip('/') + '/chat/completions'
+        body = {}
+        for k in ('model', 'messages', 'temperature', 'top_p', 'frequency_penalty',
+                  'presence_penalty', 'stream', 'stop', 'response_format',
+                  'tools', 'tool_choice', 'max_tokens', 'max_completion_tokens',
+                  'n', 'seed', 'user', 'logit_bias'):
+            if k in kwargs and kwargs[k] is not None:
+                body[k] = kwargs[k]
+        extra_body = kwargs.get('extra_body')
+        if isinstance(extra_body, dict):
+            for ek, ev in extra_body.items():
+                body.setdefault(ek, ev)
+        timeout = self._parent.timeout
+        resp = _cffi_post_with_retry(
+            url, body,
+            headers={
+                'Authorization': 'Bearer ' + self._parent.api_key,
+                'Content-Type': 'application/json',
+            },
+            timeout=timeout,
+            label='chat.completions',
+        )
+        if resp.status_code >= 400:
+            # chat.completions 不存在时（404 / HTML）→ fallback 到 Responses API
+            if not self._parent.use_responses_api_resolved:
+                self._parent.use_responses_api_resolved = True
+                return self._create_via_responses(**kwargs)
+            raise RuntimeError(
+                'API HTTPError {}: {}'.format(resp.status_code, resp.text[:500])
+            )
+        # 探测后仍走 chat.completions：但响应是 HTML 的话（cloudzone-api 网关）也走 Responses
+        ct = (resp.headers.get('content-type') or '').lower()
+        if 'html' in ct and not self._parent.use_responses_api_resolved:
+            self._parent.use_responses_api_resolved = True
+            return self._create_via_responses(**kwargs)
+        try:
+            data = resp.json()
+        except Exception as exc:
+            raise RuntimeError(
+                'API 响应非 JSON (status={}): {}'.format(resp.status_code, resp.text[:200])
+            ) from exc
+        if isinstance(data, dict) and data.get('error'):
+            raise RuntimeError("API error: {}".format(data['error']))
+        return _wrap_chat_completion_data(data)
+
+    def _create_via_responses(self, **kwargs):
+        """调用 OpenAI Responses API（/v1/responses），把 messages 翻译成 input 并把响应包装回 chat.completions 格式。"""
+        if not _CURL_CFFI_INSTALLED:
+            raise RuntimeError("curl_cffi 未安装")
+        url = self._parent.base_url.rstrip('/') + '/v1/responses'
+        messages = kwargs.get('messages') or []
+        # 合并 system + 后续 user 消息为单一 input 字符串
+        sys_parts = [str(m.get('content') or '') for m in messages if m.get('role') == 'system']
+        user_parts = []
+        for m in messages:
+            if m.get('role') in ('user', 'assistant'):
+                c = m.get('content')
+                if isinstance(c, list):
+                    c = '\n'.join(str(x.get('text') or x) for x in c if isinstance(x, dict))
+                if c:
+                    user_parts.append(str(c))
+        system_text = '\n'.join(sys_parts).strip()
+        user_text = '\n'.join(user_parts).strip()
+        if system_text and user_text:
+            input_text = system_text + '\n\n' + user_text
+        else:
+            input_text = system_text or user_text
+        body = {'model': kwargs.get('model'), 'input': input_text}
+        if 'temperature' in kwargs and kwargs['temperature'] is not None:
+            body['temperature'] = kwargs['temperature']
+        if 'top_p' in kwargs and kwargs['top_p'] is not None:
+            body['top_p'] = kwargs['top_p']
+        max_out = kwargs.get('max_tokens') or kwargs.get('max_completion_tokens')
+        if max_out:
+            body['max_output_tokens'] = max_out
+        try:
+            resp = _cffi_post_with_retry(
+                url, body,
+                headers={
+                    'Authorization': 'Bearer ' + self._parent.api_key,
+                    'Content-Type': 'application/json',
+                },
+                timeout=self._parent.timeout,
+                label='responses',
+            )
+        except RuntimeError:
+            raise
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                'API HTTPError {}: {}'.format(resp.status_code, resp.text[:500])
+            )
+        try:
+            data = resp.json()
+        except Exception as exc:
+            raise RuntimeError(
+                'API 响应非 JSON (status={}): {}'.format(resp.status_code, resp.text[:200])
+            ) from exc
+        # 解析 Responses API 响应
+        text = ''
+        for item in (data.get('output') or []):
+            if item.get('type') == 'message':
+                for c in (item.get('content') or []):
+                    if c.get('type') == 'output_text':
+                        text = c.get('text') or ''
+                        break
+                if text:
+                    break
+        # 包装回 chat.completions 格式
+        return _wrap_chat_completion_data({
+            'id': data.get('id') or '',
+            'object': 'chat.completion',
+            'created': data.get('created_at') or 0,
+            'model': data.get('model') or kwargs.get('model') or '',
+            'choices': [{
+                'index': 0,
+                'message': {'role': 'assistant', 'content': text},
+                'finish_reason': 'stop',
+            }],
+            'usage': data.get('usage') or {},
+        })
+
+
+class _CurlCffiOpenAIClient:
+    """openai.OpenAI 替代品，走 curl_cffi 绕开 Cloudflare TLS 指纹拦截。
+    自动处理 base_url 补 /v1，并探测是否需要切到 OpenAI Responses API。
+    """
+
+    def __init__(self, openai_config):
+        self.api_key = str(openai_config.get('OPENAI_API_KEY') or '')
+        raw_base = str(openai_config.get('OPENAI_BASE_URL') or 'https://api.openai.com/v1')
+        # 自动补 /v1（如果没后缀且域名不是 OpenAI 官方）
+        self.base_url = self._normalize_base_url(raw_base)
+        timeout_value = openai_config.get('OPENAI_TIMEOUT_SECONDS', 600)
+        try:
+            self.timeout = float(str(timeout_value).strip())
+        except Exception:
+            self.timeout = 600.0
+        if self.timeout <= 0:
+            self.timeout = 600.0
+        # 探测是否需要 Responses API（构造时一次）
+        self.use_responses_api_resolved = self._probe_use_responses_api()
+        self.chat = SimpleNamespace(completions=_CurlCffiChatCompletions(self))
+
+    @staticmethod
+    def _normalize_base_url(raw_base: str) -> str:
+        """如果 base_url 不带 /v1 且不是 OpenAI 官方，自动补 /v1。"""
+        b = raw_base.rstrip('/')
+        if b.endswith('/v1') or b.endswith('/v1beta') or b in ('https://api.openai.com', 'http://api.openai.com'):
+            return b + ('' if b.endswith('/v1') or b.endswith('/v1beta') else '/v1')
+        # cloudzone-api / 自建反代 / 其他：补 /v1
+        return b + '/v1'
+
+    def _probe_use_responses_api(self) -> bool:
+        """探测 /v1/chat/completions 是否存在。
+        返回 True 表示走 Responses API（/v1/responses），False 表示走标准 chat.completions。
+        """
+        if not _CURL_CFFI_INSTALLED:
+            return False
+        url = self.base_url.rstrip('/') + '/chat/completions'
+        try:
+            # 用 HEAD（轻量探测，避开 chat.completions 实际需要 POST 鉴权）
+            resp = _cffi_requests.get(
+                url,
+                headers={'Authorization': 'Bearer ' + self.api_key},
+                timeout=10,
+                impersonate='chrome120',
+                allow_redirects=False,
+            )
+            ct = (resp.headers.get('content-type') or '').lower()
+            # 404 或 HTML 响应 → 端点不存在
+            if resp.status_code == 404 or 'html' in ct:
+                return True
+            # 405/400/401/403 → 端点存在（但 GET 不允许或鉴权失败）
+            return False
+        except Exception:
+            return False
+
+
 # Pre-compiled regex patterns for _pre_clean (performance optimization)
 _URL_PATTERNS = [
     re.compile(r'https?://[^\s\u4e00-\u9fff]+', re.IGNORECASE),
@@ -158,11 +445,12 @@ def setup_task_logger(task_id):
 
 def get_openai_client(openai_config):
     """
-    创建OpenAI客户端。
-
-    统一走 modules.ai_fallback_client.get_ai_client，主端点（OPENAI_*）不可用时
-    自动切换到 FALLBACK_OPENAI_* 兜底端点；未配置兜底则退化为单端点，行为不变。
+    创建OpenAI客户端。优先使用 curl_cffi 客户端，绕过 Cloudflare TLS 指纹拦截；
+    curl_cffi 不可用时退到 modules.ai_fallback_client.get_ai_client（主端点 OPENAI_*
+    不可用时自动切换到 FALLBACK_OPENAI_* 兜底端点；未配置兜底则单端点，行为不变）。
     """
+    if _CURL_CFFI_INSTALLED:
+        return _CurlCffiOpenAIClient(openai_config)
     from modules.ai_fallback_client import get_ai_client
     return get_ai_client(openai_config)
 
