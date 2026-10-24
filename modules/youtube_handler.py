@@ -260,11 +260,18 @@ def _build_quality_retry_strategies(config: dict[str, Any] | None, has_ffmpeg: b
     max_height = normalize_youtube_download_max_height((config or {}).get('YOUTUBE_DOWNLOAD_MAX_HEIGHT'))
     manual = mode == 'manual'
 
+    # 2026-10-25: YouTube 对 DASH 分离流（bestvideo+bestaudio）在当前网络/账号下
+    # 稳定在约 27% 处返回 403，而 HLS 合成流（m3u8_native）可正常下载。
+    # 优先选 HLS 合成格式，`best` 兜底仍会选合成格式，不再优先 DASH。
     if manual:
-        primary_selector = f'bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]'
+        primary_selector = (
+            f'best[height<={max_height}][protocol*=m3u8]'
+            f'/best[height<={max_height}]'
+            f'/best[protocol*=m3u8]/best'
+        )
         fallback_selector = f'best[height<={max_height}]'
     else:
-        primary_selector = 'bestvideo+bestaudio/best'
+        primary_selector = 'best[protocol*=m3u8]/best'
         fallback_selector = 'best'
 
     strategies: list[dict[str, Any]] = []
@@ -272,7 +279,7 @@ def _build_quality_retry_strategies(config: dict[str, Any] | None, has_ffmpeg: b
         strategies.append({
             'selector': primary_selector,
             'merge_output_format': 'mp4',
-            'label': 'bestvideo+bestaudio',
+            'label': 'hls/best',
         })
     strategies.append({
         'selector': fallback_selector,
